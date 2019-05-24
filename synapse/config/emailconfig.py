@@ -126,10 +126,12 @@ class EmailConfig(Config):
 
     def default_config(self, config_dir_path, server_name, **kwargs):
         return """
-        # Enable sending emails for notification events or expiry notices
+        # Enable sending emails for password reset emails, notification events
+        # or expiry notices
+        #
         # Defining a custom URL for Riot is only needed if email notifications
         # should contain links to a self-hosted installation of Riot; when set
-        # the "app_name" setting is ignored.
+        # the "app_name" setting is ignored
         #
         # If your SMTP server requires authentication, the optional smtp_user &
         # smtp_pass variables should be used
