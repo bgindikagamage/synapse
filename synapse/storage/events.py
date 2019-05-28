@@ -221,6 +221,7 @@ class EventsStore(
 ):
     EVENT_ORIGIN_SERVER_TS_NAME = "event_origin_server_ts"
     EVENT_FIELDS_SENDER_URL_UPDATE_NAME = "event_fields_sender_url"
+    EVENT_DELETE_SOFT_FAILED_EXTREMITIES = "delete_soft_failed_extremities"
 
     def __init__(self, db_conn, hs):
         super(EventsStore, self).__init__(db_conn, hs)
@@ -250,6 +251,11 @@ class EventsStore(
             columns=["event_id"],
             unique=True,
             psql_only=True,
+        )
+
+        self.register_background_update_handler(
+            self.EVENT_DELETE_SOFT_FAILED_EXTREMITIES,
+            self._cleanup_extremities_bg_update,
         )
 
         self._event_persist_queue = _EventPeristenceQueue()
@@ -2339,6 +2345,143 @@ class EventsStore(
             "get_all_updated_current_state_deltas",
             get_all_updated_current_state_deltas_txn,
         )
+
+    @defer.inlineCallbacks
+    def _cleanup_extremities_bg_update(self, progress, batch_size):
+        """Background update to clean out extremities that should have been
+        deleted previously.
+
+        Mainly used to deal with the aftermath of #5269
+        """
+        def _cleanup_extremities_bg_update_txn(txn):
+            # The set of event IDs that we're checking this round
+            original_set = set()
+
+            # A dict[str, set[str]] of event ID to their prev events.
+            graph = {}
+
+            # The set of descendants of the original set that are not rejected
+            # nor soft-failed. Ancestors of these events should be removed
+            # from the forward extremities table.
+            non_rejected_roots = set()
+
+            # Set of event IDs that have been soft failed and we should check
+            # if they have descendants which haven't been soft failed.
+            soft_failed_events_to_lookup = set()
+
+            # First we get `batch_size` events from the table, pulling out
+            # their prev events if any, and their prev events rejection status.
+            txn.execute(
+                """SELECT prev_event_id, event_id, internal_metadata,
+                    rejections.event_id IS NOT NULL
+                FROM (
+                    SELECT event_id AS prev_event_id
+                    FROM _extremities_to_check
+                    LIMIT ?
+                ) AS f
+                LEFT JOIN event_edges USING (prev_event_id)
+                LEFT JOIN events USING (event_id)
+                LEFT JOIN event_json USING (event_id)
+                LEFT JOIN rejections USING (event_id)
+                WHERE
+                    NOT events.outlier
+                """, (batch_size,)
+            )
+
+            for prev_event_id, event_id, metadata, rejected in txn:
+                original_set.add(event_id)
+                graph.setdefault(event_id, set()).add(prev_event_id)
+
+                if not event_id:
+                    # Common case where the forward extremity doesn't have any
+                    # descendants.
+                    continue
+
+                soft_failed = False
+                if metadata:
+                    soft_failed = json.loads(metadata).get("soft_failed")
+
+                if soft_failed or rejected:
+                    soft_failed_events_to_lookup.add(event_id)
+                else:
+                    non_rejected_roots.add(event_id)
+
+            while soft_failed_events_to_lookup:
+                sql = """SELECT prev_event_id, event_id, internal_metadata,
+                    rejections.event_id IS NOT NULL
+                    FROM event_edges
+                    LEFT JOIN events USING (event_id)
+                    LEFT JOIN event_json USING (event_id)
+                    LEFT JOIN rejections USING (event_id)
+                    WHERE
+                        prev_event_id IN (%s)
+                        AND NOT events.outlier
+                """ % (
+                    ",".join("?" for _ in soft_failed_events_to_lookup),
+                )
+
+                # We only want to do 100 at a time, so we split given list
+                # into two.
+                batch = list(soft_failed_events_to_lookup)
+                to_check, to_defer = batch[:100], batch[100:]
+                soft_failed_events_to_lookup = set(to_defer)
+
+                txn.execute(sql, to_check)
+
+                for prev_event_id, event_id, metadata, rejected in txn:
+                    if event_id in graph:
+                        # Already handled this event previously.
+                        continue
+
+                    graph.setdefault(event_id, set()).add(prev_event_id)
+
+                    soft_failed = json.loads(metadata).get("soft_failed")
+                    if soft_failed or rejected:
+                        soft_failed_events_to_lookup.add(event_id)
+                    else:
+                        non_rejected_roots.add(event_id)
+
+            # We have a set of non-soft-failed descendants, so we recurse up
+            # the graph to find all ancestors and add them to the set of event
+            # IDs that we can delete from forward extremities table.
+            to_delete = set()
+            while non_rejected_roots:
+                event_id = non_rejected_roots.pop()
+                non_rejected_roots.update(graph[event_id])
+                to_delete.update(graph[event_id])
+
+            to_delete.intersection_update(original_set)
+
+            logger.info("Deleting %d forward extremities", len(to_delete))
+
+            self._simple_delete_many_txn(
+                txn=txn,
+                table="event_forward_extremities",
+                column="event_id",
+                iterable=to_delete,
+                keyvalues={},
+            )
+
+            logger.info("Deleted %d forward extremities", len(to_delete))
+
+            self._simple_delete_many_txn(
+                txn=txn,
+                table="_extremities_to_check",
+                column="event_id",
+                iterable=original_set,
+                keyvalues={},
+            )
+
+            return len(original_set)
+
+        num_handled = yield self.runInteraction(
+            "_cleanup_extremities_bg_update", _cleanup_extremities_bg_update_txn,
+        )
+
+        if not num_handled:
+            yield self._end_background_update("delete_soft_failed_extremities")
+
+        defer.returnValue(num_handled)
 
 
 AllNewEventsResult = namedtuple(
