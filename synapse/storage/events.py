@@ -2351,10 +2351,25 @@ class EventsStore(
         """Background update to clean out extremities that should have been
         deleted previously.
 
-        Mainly used to deal with the aftermath of #5269
+        Mainly used to deal with the aftermath of #5269.
         """
+
+        # This works by first copying all existing forward extremities into the
+        # `_extremities_to_check` table at start up, and then checking each
+        # event in that table whether we have any descendants that are not
+        # soft-failed/rejected. If that is the case then we delete that event
+        # from the forward extremities table.
+        #
+        # For efficiency, we do this in batches by recursively pulling out all
+        # descendants of a batch until we find the non soft-failed/rejected
+        # events, i.e. the set of descendants whose chain of prev events back
+        # to the batch of extremities are all soft-failed or rejected.
+        # Typically, we won't find any such events as extremities will rarely
+        # have any descendants, but if they do then we should delete those
+        # extremities.
+
         def _cleanup_extremities_bg_update_txn(txn):
-            # The set of event IDs that we're checking this round
+            # The set of extremity event IDs that we're checking this round
             original_set = set()
 
             # A dict[str, set[str]] of event ID to their prev events.
@@ -2363,14 +2378,15 @@ class EventsStore(
             # The set of descendants of the original set that are not rejected
             # nor soft-failed. Ancestors of these events should be removed
             # from the forward extremities table.
-            non_rejected_roots = set()
+            non_rejected_leaves = set()
 
-            # Set of event IDs that have been soft failed and we should check
-            # if they have descendants which haven't been soft failed.
+            # Set of event IDs that have been soft failed, and for which we
+            # should check if they have descendants which haven't been soft
+            # failed.
             soft_failed_events_to_lookup = set()
 
-            # First we get `batch_size` events from the table, pulling out
-            # their prev events if any, and their prev events rejection status.
+            # First, we get `batch_size` events from the table, pulling out
+            # their prev events, if any, and their prev events rejection status.
             txn.execute(
                 """SELECT prev_event_id, event_id, internal_metadata,
                     rejections.event_id IS NOT NULL
@@ -2404,8 +2420,11 @@ class EventsStore(
                 if soft_failed or rejected:
                     soft_failed_events_to_lookup.add(event_id)
                 else:
-                    non_rejected_roots.add(event_id)
+                    non_rejected_leaves.add(event_id)
 
+            # Now we recursively check all the soft-failed descendants we
+            # found above in the same way, until we have nothing left to
+            # check.
             while soft_failed_events_to_lookup:
                 sql = """SELECT prev_event_id, event_id, internal_metadata,
                     rejections.event_id IS NOT NULL
@@ -2439,15 +2458,15 @@ class EventsStore(
                     if soft_failed or rejected:
                         soft_failed_events_to_lookup.add(event_id)
                     else:
-                        non_rejected_roots.add(event_id)
+                        non_rejected_leaves.add(event_id)
 
             # We have a set of non-soft-failed descendants, so we recurse up
             # the graph to find all ancestors and add them to the set of event
             # IDs that we can delete from forward extremities table.
             to_delete = set()
-            while non_rejected_roots:
-                event_id = non_rejected_roots.pop()
-                non_rejected_roots.update(graph[event_id])
+            while non_rejected_leaves:
+                event_id = non_rejected_leaves.pop()
+                non_rejected_leaves.update(graph[event_id])
                 to_delete.update(graph[event_id])
 
             to_delete.intersection_update(original_set)
@@ -2462,7 +2481,7 @@ class EventsStore(
                 keyvalues={},
             )
 
-            logger.info("Deleted %d forward extremities", len(to_delete))
+            logger.info("Deleted %d forward extremities", txn.rowcount)
 
             self._simple_delete_many_txn(
                 txn=txn,
